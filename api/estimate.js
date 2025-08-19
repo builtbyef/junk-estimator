@@ -1,9 +1,12 @@
 // api/estimate.js — Vercel serverless function (Node 18+)
-// INPUT  (JSON): { description, zip, images:[dataURL... <=10], service_mode?, dimensions?, materials?, access?, distance_miles? }
-// OUTPUT (JSON): { one_liner, lowTotal, highTotal, currency:"USD", recommendedDuration, zip }
+// INPUT:  { description, zip, images: [dataURL...], service_mode?, dimensions?, materials?, access?, distance_miles? }
+// OUTPUT: { one_liner, lowTotal, highTotal, recommendedDuration, currency: "USD", zip }
+// DEBUG:  set env var DEBUG=1 in Vercel to see detailed error responses
+
+const DEBUG = process.env.DEBUG === '1';
 
 export default async function handler(req, res) {
-  // --- CORS (allow Squarespace to call this endpoint) ---
+  // CORS
   const origin = req.headers.origin || '*';
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
@@ -14,30 +17,33 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
 
-  if (!process.env.OPENAI_API_KEY) {
-    return res.status(500).json({ error: 'Missing OPENAI_API_KEY on server' });
-  }
-
+  // Health check: send { ping: true } to verify the route works without OpenAI
   try {
-    // --- Read & normalize body ---
     let body = req.body;
     if (!body || typeof body === 'string') {
       try { body = JSON.parse(body || '{}'); } catch { body = {}; }
     }
+    if (body.ping) return res.status(200).json({ ok: true, msg: 'pong' });
+
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: 'Missing OPENAI_API_KEY on server' });
+    }
+
     const {
       description = '',
       zip = '',
       images = [],
-      service_mode = null,     // "curbside" or "full-service" (optional)
-      dimensions = null,       // { length_ft, width_ft, height_ft } or similar (optional)
-      materials = null,        // e.g. ["household","wood"] (optional)
-      access = null,           // e.g. { stairs:true, long_carry:true, extra_minutes:0 } (optional)
-      distance_miles = null    // one-way miles from base (optional)
+      service_mode = null,
+      dimensions = null,
+      materials = null,
+      access = null,
+      distance_miles = null
     } = body;
 
-    const imgList = Array.isArray(images) ? images.slice(0, 10) : [];
+    // keep payload small to avoid 413 errors
+    const imgList = Array.isArray(images) ? images.slice(0, 6) : [];
 
-    // --- YOUR PROMPT (exactly as provided) ---
+    // --- Your exact prompt ---
     const SYSTEM_PROMPT = `
 You are an Eastern-CT junk-removal quoting assistant for a 5×8×3 ft trailer (≈4.5 yd³; each 1 ft of trailer length ≈0.56 yd³). Use the customer inputs (photos/notes, pile length×width×height in feet, materials, access, distance, items) to estimate yards³ and weight, then price using the schedule below. Be concise; output only one sentence ending with an estimated price RANGE about $75–$125 wide.
 
@@ -77,27 +83,15 @@ Output format example (don’t add anything else):
 “Full-service removal, driveway to basement carry included and up to X lb disposal—Estimated range: $___–$___.”
     `.trim();
 
-    // --- Build a structured "user" payload + photos for the model ---
+    // Build structured input + photos
     const userPayload = {
-      base_zip: "06226",
-      description,
-      zip,
-      service_mode,
-      dimensions,
-      materials,
-      access,
-      distance_miles,
-      // You can add more fields later without changing the front end
+      base_zip: '06226',
+      description, zip, service_mode, dimensions, materials, access, distance_miles
     };
+    const content = [{ type: 'text', text: "INPUTS (JSON):\n" + JSON.stringify(userPayload, null, 2) }];
+    for (const dataUrl of imgList) content.push({ type: 'input_image', image_url: dataUrl });
 
-    const content = [
-      { type: 'text', text: "INPUTS (JSON):\n" + JSON.stringify(userPayload, null, 2) }
-    ];
-    for (const dataUrl of imgList) {
-      content.push({ type: 'input_image', image_url: dataUrl });
-    }
-
-    // --- Call OpenAI (Responses API) ---
+    // Call OpenAI
     const aiRes = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
@@ -105,85 +99,77 @@ Output format example (don’t add anything else):
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',    // vision-capable & fast
+        model: 'gpt-4o-mini',
         input: [
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user',   content }
-        ],
-        // We want a single sentence, so plain text output is fine
+        ]
       })
     });
 
     if (!aiRes.ok) {
       const t = await aiRes.text();
-      throw new Error(`OpenAI error: ${t}`);
+      if (DEBUG) return res.status(aiRes.status || 502).json({ error: 'OpenAI error', details: t });
+      throw new Error(`OpenAI ${aiRes.status}: ${t}`);
     }
 
     const aiJson = await aiRes.json();
     const one_liner =
       aiJson.output_text?.trim?.() ||
       aiJson.choices?.[0]?.message?.content?.trim?.() ||
-      ""; // best-effort extraction across SDK shapes
+      '';
 
     if (!one_liner) {
-      return res.status(502).json({ error: 'AI returned empty response' });
+      if (DEBUG) return res.status(502).json({ error: 'Empty model response', details: aiJson });
+      throw new Error('Empty model response');
     }
 
-    // --- Parse the two dollar amounts from the sentence for UI range ---
+    // Extract money range from the sentence
     const { low, high } = extractDollarRange(one_liner);
-    // Fallback (rare): create a +/- $50 window around any single number we found
     let lowTotal = low, highTotal = high;
     if (lowTotal == null && highTotal == null) {
       const mid = extractSingleAmount(one_liner);
       if (mid != null) { lowTotal = Math.max(99, mid - 50); highTotal = mid + 50; }
     }
-    // Final fallback if nothing parsable:
-    if (lowTotal == null || highTotal == null) {
-      lowTotal = 149; highTotal = 229; // safe placeholder if parsing fails
-    }
-    // Clean ordering
+    if (lowTotal == null || highTotal == null) { lowTotal = 149; highTotal = 229; }
     if (lowTotal > highTotal) [lowTotal, highTotal] = [highTotal, lowTotal];
 
-    // --- Optional: rough duration guess to open the right booking length ---
     const recommendedDuration =
       highTotal <= 200 ? '60m' :
       highTotal <= 350 ? '90m' :
       highTotal <= 500 ? '120m' : '180m';
 
-    // --- Return JSON for your page ---
     return res.status(200).json({
       one_liner,
       lowTotal: Math.round(lowTotal),
       highTotal: Math.round(highTotal),
-      currency: 'USD',
       recommendedDuration,
+      currency: 'USD',
       zip
     });
 
   } catch (err) {
     console.error(err);
+    if (DEBUG) return res.status(500).json({ error: 'Estimator error', details: String(err?.message || err) });
     return res.status(500).json({ error: 'Estimator error' });
   }
 }
 
-/* ---------------- helpers ---------------- */
+/* --------- helpers --------- */
 function extractDollarRange(text) {
-  // Grab $ amounts like $95, $1,295, 1295 (with/without $ and commas)
   const re = /\$?\s*\d{2,5}(?:,\d{3})?(?:\.\d{2})?/g;
-  const matches = (text.match(re) || []).map(cleanMoney).filter(n => n != null);
-  if (matches.length >= 2) {
-    const sorted = matches.sort((a,b)=>a-b);
-    return { low: sorted[0], high: sorted[sorted.length-1] };
+  const arr = (text.match(re) || []).map(cleanMoney).filter(x => x != null);
+  if (arr.length >= 2) {
+    const s = arr.sort((a,b)=>a-b);
+    return { low: s[0], high: s[s.length-1] };
   }
   return { low: null, high: null };
 }
 function extractSingleAmount(text) {
-  const re = /\$?\s*\d{2,5}(?:,\d{3})?(?:\.\d{2})?/;
-  const m = text.match(re);
+  const m = text.match(/\$?\s*\d{2,5}(?:,\d{3})?(?:\.\d{2})?/);
   return m ? cleanMoney(m[0]) : null;
 }
 function cleanMoney(s) {
-  if (!s) return null;
   const n = Number(String(s).replace(/[^0-9.]/g,''));
   return Number.isFinite(n) ? Math.round(n) : null;
 }
