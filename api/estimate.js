@@ -1,24 +1,25 @@
 // api/estimate.js — Vercel serverless function (Node 18+)
-// INPUT:  { description, zip, images: [dataURL...], service_mode?, dimensions?, materials?, access?, distance_miles? }
-// OUTPUT: { one_liner, lowTotal, highTotal, recommendedDuration, currency: "USD", zip }
-// DEBUG:  set env var DEBUG=1 in Vercel to see detailed error responses
+// INPUT  (JSON): { description, zip, images:[dataURL... <=10], service_mode?, dimensions?, materials?, access?, distance_miles? }
+// OUTPUT (JSON): { one_liner, lowTotal, highTotal, currency:"USD", recommendedDuration, zip }
+// DEBUG: set env var DEBUG=1 in Vercel to get detailed error bodies
 
 const DEBUG = process.env.DEBUG === '1';
 
 export default async function handler(req, res) {
-  // CORS
+  // ---- CORS ----
   const origin = req.headers.origin || '*';
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers',
+  res.setHeader(
+    'Access-Control-Allow-Headers',
     req.headers['access-control-request-headers'] || 'Content-Type, Authorization'
   );
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
 
-  // Health check: send { ping: true } to verify the route works without OpenAI
   try {
+    // ---- Parse body & health check ----
     let body = req.body;
     if (!body || typeof body === 'string') {
       try { body = JSON.parse(body || '{}'); } catch { body = {}; }
@@ -33,17 +34,17 @@ export default async function handler(req, res) {
       description = '',
       zip = '',
       images = [],
-      service_mode = null,
-      dimensions = null,
-      materials = null,
-      access = null,
-      distance_miles = null
+      service_mode = null,   // "curbside" | "full-service" (optional)
+      dimensions = null,     // { length_ft, width_ft, height_ft } (optional)
+      materials = null,      // e.g., ["household","wood"] (optional)
+      access = null,         // { stairs:true, long_carry:true, extra_minutes:0 } (optional)
+      distance_miles = null  // one-way miles (optional)
     } = body;
 
-    // keep payload small to avoid 413 errors
+    // Keep payload small to avoid 413s
     const imgList = Array.isArray(images) ? images.slice(0, 6) : [];
 
-    // --- Your exact prompt ---
+    // ---- Your exact pricing prompt ----
     const SYSTEM_PROMPT = `
 You are an Eastern-CT junk-removal quoting assistant for a 5×8×3 ft trailer (≈4.5 yd³; each 1 ft of trailer length ≈0.56 yd³). Use the customer inputs (photos/notes, pile length×width×height in feet, materials, access, distance, items) to estimate yards³ and weight, then price using the schedule below. Be concise; output only one sentence ending with an estimated price RANGE about $75–$125 wide.
 
@@ -83,15 +84,20 @@ Output format example (don’t add anything else):
 “Full-service removal, driveway to basement carry included and up to X lb disposal—Estimated range: $___–$___.”
     `.trim();
 
-    // Build structured input + photos
+    // ---- Build user parts for Responses API (input_text + input_image) ----
     const userPayload = {
       base_zip: '06226',
       description, zip, service_mode, dimensions, materials, access, distance_miles
     };
-    const content = [{ type: 'text', text: "INPUTS (JSON):\n" + JSON.stringify(userPayload, null, 2) }];
-    for (const dataUrl of imgList) content.push({ type: 'input_image', image_url: dataUrl });
 
-    // Call OpenAI
+    const userParts = [
+      { type: 'input_text', text: "INPUTS (JSON):\n" + JSON.stringify(userPayload, null, 2) }
+    ];
+    for (const dataUrl of imgList) {
+      userParts.push({ type: 'input_image', image_url: dataUrl });
+    }
+
+    // ---- Call OpenAI Responses API ----
     const aiRes = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
@@ -99,10 +105,10 @@ Output format example (don’t add anything else):
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'gpt-4o-mini',  // vision-capable & fast
         input: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user',   content }
+          { role: 'system', content: [ { type: 'input_text', text: SYSTEM_PROMPT } ] },
+          { role: 'user',   content: userParts }
         ]
       })
     });
@@ -124,7 +130,7 @@ Output format example (don’t add anything else):
       throw new Error('Empty model response');
     }
 
-    // Extract money range from the sentence
+    // ---- Extract $low–$high from the sentence for UI ----
     const { low, high } = extractDollarRange(one_liner);
     let lowTotal = low, highTotal = high;
     if (lowTotal == null && highTotal == null) {
@@ -134,6 +140,7 @@ Output format example (don’t add anything else):
     if (lowTotal == null || highTotal == null) { lowTotal = 149; highTotal = 229; }
     if (lowTotal > highTotal) [lowTotal, highTotal] = [highTotal, lowTotal];
 
+    // Simple duration heuristic for opening the right booking link
     const recommendedDuration =
       highTotal <= 200 ? '60m' :
       highTotal <= 350 ? '90m' :
@@ -143,8 +150,8 @@ Output format example (don’t add anything else):
       one_liner,
       lowTotal: Math.round(lowTotal),
       highTotal: Math.round(highTotal),
-      recommendedDuration,
       currency: 'USD',
+      recommendedDuration,
       zip
     });
 
@@ -155,13 +162,14 @@ Output format example (don’t add anything else):
   }
 }
 
-/* --------- helpers --------- */
+/* -------- helpers -------- */
 function extractDollarRange(text) {
+  // Matches $95, $1,295, 1295, etc.
   const re = /\$?\s*\d{2,5}(?:,\d{3})?(?:\.\d{2})?/g;
   const arr = (text.match(re) || []).map(cleanMoney).filter(x => x != null);
   if (arr.length >= 2) {
     const s = arr.sort((a,b)=>a-b);
-    return { low: s[0], high: s[s.length-1] };
+    return { low: s[0], high: s[s.length - 1] };
   }
   return { low: null, high: null };
 }
