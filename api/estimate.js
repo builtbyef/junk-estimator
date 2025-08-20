@@ -1,190 +1,198 @@
-// api/estimate.js — Vercel Serverless Function (Node 18+)
-// INPUT (JSON): { description, zip, images:[dataURL... <=10], service_mode?, dimensions?, materials?, access?, distance_miles? }
-// OUTPUT (JSON): { one_liner, lowTotal, highTotal, currency:"USD", recommendedDuration, zip, debug? }
+// api/estimate.mjs
+export const config = { runtime: "nodejs18.x" };
 
-const DEBUG = process.env.DEBUG === '1';
+const OPENAI_ENDPOINT = "https://api.openai.com/v1/responses";
+const MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini"; // text+vision capable; cost-effective
 
-export default async function handler(req, res) {
-  // ---- CORS ----
-  const origin = req.headers.origin || '*';
-  res.setHeader('Access-Control-Allow-Origin', origin);
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS, GET');
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    req.headers['access-control-request-headers'] || 'Content-Type, Authorization'
-  );
-  if (req.method === 'OPTIONS') return res.status(200).end();
+// ---- EDIT YOUR PRICING HERE ----
+const PRICING = {
+  currency: "USD",
+  minimum_fee: 85,                // minimum to roll a truck
+  base_per_cubic_yard: 60,        // general junk per cubic yard
+  trailer: {                       // your 5x8x3 ft trailer ≈ 4.44 CY
+    length_ft: 8, width_ft: 5, wall_ft: 3, capacity_cy: 4.44
+  },
+  heavy_materials: {              // per CY adders (weight/transfer fees)
+    concrete: 100, brick: 80, dirt: 70, shingles: 90
+  },
+  item_flat_fees: {               // add per item (examples—edit freely)
+    mattress: 80, box_spring: 60, refrigerator: 140, chest_freezer: 150,
+    couch_small: 90, couch_large: 130, dresser: 60, tv_tube: 65, piano: 350
+  },
+  surcharges: {
+    stairs_per_flight: 15,        // handling upstairs/downstairs
+    long_carry_per_50ft: 10,      // from curb/drive
+    disassembly_simple: 25,       // e.g., small furniture
+    disassembly_heavy: 60,        // e.g., sheds/hot tubs (not demolition)
+  },
+  distance_zones: [               // OPTIONAL: quick ZIP zoning
+    { name: "Zone 1", zip_prefixes: ["062", "063"], add: 0 },
+    { name: "Zone 2", zip_prefixes: ["060", "064"], add: 25 },
+    { name: "Zone 3", zip_prefixes: ["065", "066", "067"], add: 50 }
+  ],
+  taxes_pct: 0,                   // set if you tax service
+  desired_range_width: 75         // aim to keep quotes within ~this spread
+};
+// ---- END PRICING ----
 
-  // Simple GET ping for quick checks
-  if (req.method === 'GET') {
-    return res.status(200).json({ ok: true, msg: 'estimator up' });
+function corsHeaders(origin) {
+  const allowList = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+  const allowed = allowList.length === 0 ? "*" : (allowList.includes(origin) ? origin : allowList[0]);
+  return {
+    "Access-Control-Allow-Origin": allowed,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Vary": "Origin"
+  };
+}
+
+function json(res, status, body, origin) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders(origin) }
+  });
+}
+
+export default async function handler(req) {
+  const origin = req.headers.get("origin") || "";
+
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders(origin) });
   }
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
+  if (req.method !== "POST") {
+    return json(null, 405, { error: "Method not allowed" }, origin);
+  }
 
+  let payload;
   try {
-    // ---- Parse body & health check ----
-    let body = req.body;
-    if (!body || typeof body === 'string') {
-      try { body = JSON.parse(body || '{}'); } catch { body = {}; }
-    }
-    if (body.ping) return res.status(200).json({ ok: true, msg: 'pong' });
+    payload = await req.json();
+  } catch {
+    return json(null, 400, { error: "Invalid JSON" }, origin);
+  }
 
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: 'Missing OPENAI_API_KEY on server' });
-    }
+  const { zipcode, description, images } = payload || {};
+  if (!zipcode || !/^\d{5}$/.test(String(zipcode))) {
+    return json(null, 400, { error: "A valid 5-digit zipcode is required." }, origin);
+  }
+  if (!description || typeof description !== "string") {
+    return json(null, 400, { error: "A description is required." }, origin);
+  }
+  if (!Array.isArray(images) || images.length === 0) {
+    return json(null, 400, { error: "At least one photo is required." }, origin);
+  }
+  if (images.length > 6) {
+    return json(null, 400, { error: "Please upload up to 6 photos." }, origin);
+  }
 
-    const {
-      description = '',
-      zip = '',
-      images = [],
-      service_mode = null,   // "curbside" | "full-service" (optional)
-      dimensions = null,     // { length_ft, width_ft, height_ft } (optional)
-      materials = null,      // e.g., ["household","wood"] (optional)
-      access = null,         // { stairs:true, long_carry:true, extra_minutes:0 } (optional)
-      distance_miles = null  // one-way miles (optional)
-    } = body;
+  // Build a compact but strict system prompt and attach your pricing as JSON.
+  const systemPrompt = `
+You price junk removal jobs for a small business in New England. Use the PRICING JSON to estimate cubic yards from the description and photos, add fair surcharges, then output a SINGLE clean quote range customers can understand.
 
-    // ---- Keep payload small ----
-    const imgList = Array.isArray(images) ? images.slice(0, 6) : [];
+Rules:
+- Prioritize cubic yard estimate from photos; cross-check with description.
+- Add flat fees for listed items, and heavy material adders if present.
+- Apply distance zone by zipcode prefix (best match).
+- Respect minimum fee.
+- Keep the range tight (about +/- ${(PRICING.desired_range_width/2)|0} around midpoint). If uncertainty is high, you may widen, but explain briefly in notes.
+- NEVER show internal math to the customer; return structured JSON ONLY.
 
-    // ---- Pricing/logic prompt ----
-    const SYSTEM_PROMPT = `
-You are an Eastern-CT junk-removal quoting assistant for a 5×8×3 ft trailer (≈4.5 yd³; each 1 ft of trailer length ≈0.56 yd³). Use the customer inputs (photos/notes, pile length×width×height in feet, materials, access, distance, items) to estimate yards³ and weight, then price using the schedule below. Be concise; output only one sentence ending with an estimated price RANGE about $75–$125 wide.
-
-VOLUME PRICING (household/light junk; choose curbside or full-service):
-- Curbside (driveway/garage edge): full 4.5 yd³ $425; 3.3 yd³ $335; 2.2 yd³ $225; 1.1 yd³ $115; min 0.7 yd³ $99.
-- Full-service (we lift from anywhere): full 4.5 yd³ $495; 3.3 yd³ $385; 2.2 yd³ $265; 1.1 yd³ $135; min 0.7 yd³ $129.
-- Shortcut rates if between brackets: ~ $95/yd³ curbside, $110/yd³ full-service; then snap to the nearest bracket above.
-
-INCLUDED WEIGHT & Overage:
-- Included: up to 0.5 ton (1,000 lb) per full trailer, scaled by fill (included_lb = 1000 × yards/4.5).
-- If estimated weight > included, add $60 per extra 250 lb (0.125 ton).
-
-HEAVY MATERIAL RATES (use these when materials are ≥50% of load or obviously dense):
-- Mixed C&D: $125/yd³ (3 yd³ min).
-- Asphalt shingles: $140/yd³.
-- Soil/rock/concrete/brick: $175/yd³ (limit 1–2 yd³ per trip unless payload allows).
-
-COMMON ITEM FLATS (use item price if it’s a single/small pickup and cheaper than volume):
-- Mattress/box: $95 curbside / $115 full.
-- Fridge/AC (freon): $65–$85.
-- Sofa: $110–$145.
-- Treadmill/safe/piano (awkward/heavy): $200–$350 (+stairs/carry if applicable).
-
-SURCHARGES / DISCOUNTS:
-- Access/time: +$20–$40 for stairs; +$20 for >50 ft carry; +$25 per extra 15 min beyond 20 min on-site.
-- Distance: first 20 road miles included from base; then +$2.25 per one-way mile.
-- Choose curbside pricing if customer stages at curb; otherwise full-service.
-
-ESTIMATION LOGIC:
-1) Estimate yards³ from photos/notes: if “feet of trailer filled” given, yards ≈ feet×0.56; else use L×W×H/27. Cap at 4.5 yd³ per trip.
-2) If heavy material threshold met, use heavy per-yd³ pricing; else compute household price via per-yd rate, then snap to the nearest bracket.
-3) Estimate weight by material type (light household ~200–300 lb/yd³; C&D much heavier). Apply overage if above included.
-4) Add distance and access adjustments. If only one bulky item, compare item flat vs volume and choose lower.
-5) Output a SINGLE short customer-facing line summarizing service mode and what’s included, ENDING with an estimated RANGE about $75–$125 wide centered on your computed price.
-
-Output format example (don’t add anything else):
-"Full-service removal, driveway to basement carry included and up to X lb disposal—Estimated range: $***–$***."
+PRICING_JSON:
+${JSON.stringify(PRICING)}
 `.trim();
 
-    // ---- Build user content (text + images) ----
-    const userPayload = {
-      base_zip: '06226',
-      description, zip, service_mode, dimensions, materials, access, distance_miles
-    };
+  // Compose Responses API input parts correctly (no 'text' type—use input_text/input_image).
+  const input = [
+    {
+      role: "system",
+      content: [{ type: "input_text", text: systemPrompt }]
+    },
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: `ZIP: ${zipcode}\nDESCRIPTION:\n${description}` },
+        // images are data URLs already (or external https URLs). The Responses API accepts full URLs.
+        ...images.map(url => ({ type: "input_image", image_url: url }))
+      ]
+    }
+  ];
 
-    const userContent = [
-      { type: 'text', text: "INPUTS (JSON):\n" + JSON.stringify(userPayload, null, 2) }
-    ];
-    for (const dataUrl of imgList) {
-      if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
-        // Chat Completions multimodal requires an object with a url field
-        userContent.push({ type: 'image_url', image_url: { url: dataUrl } });
+  // Structured Outputs: force a predictable JSON schema.
+  const responseFormat = {
+    type: "json_schema",
+    json_schema: {
+      name: "junk_quote",
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          low: { type: "integer", minimum: 0 },
+          high: { type: "integer", minimum: 0 },
+          midpoint: { type: "integer", minimum: 0 },
+          confidence: { type: "string", enum: ["low", "medium", "high"] },
+          yard_estimate: { type: "number", minimum: 0 },
+          distance_zone: { type: "string" },
+          line_items: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                label: { type: "string" },
+                qty: { type: "number" },
+                unit: { type: "string" },
+                subtotal: { type: "integer", minimum: 0 }
+              },
+              required: ["label", "subtotal"]
+            }
+          },
+          notes: { type: "string" }
+        },
+        required: ["low", "high", "midpoint", "confidence", "yard_estimate", "line_items", "notes"]
       }
     }
+  };
 
-    // ---- Call OpenAI Chat Completions (multimodal) ----
-    const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
+  try {
+    const aiRes = await fetch(OPENAI_ENDPOINT, {
+      method: "POST",
       headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user',   content: userContent }
-        ],
-        temperature: 0.2,
-        max_tokens: 180
+        model: MODEL,
+        input,
+        response_format: responseFormat,
+        temperature: 0.2
       })
     });
 
     if (!aiRes.ok) {
-      const t = await aiRes.text();
-      if (DEBUG) return res.status(aiRes.status || 502).json({ error: 'OpenAI error', details: t });
-      throw new Error(`OpenAI ${aiRes.status}: ${t}`);
+      const err = await aiRes.text();
+      return json(null, 502, { error: "OpenAI error", detail: err }, origin);
     }
 
-    const aiJson = await aiRes.json();
-    const one_liner = aiJson?.choices?.[0]?.message?.content?.trim?.() || '';
-    if (!one_liner) {
-      if (DEBUG) return res.status(502).json({ error: 'Empty model response', details: aiJson });
-      throw new Error('Empty model response');
+    const data = await aiRes.json();
+
+    // The Responses API returns either output_text or structured content.
+    const raw =
+      data.output_text ??
+      data.output?.[0]?.content?.[0]?.text ??
+      JSON.stringify(data);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      // Fallback: try to extract JSON if wrapped in text.
+      const m = raw.match(/\{[\s\S]*\}/);
+      parsed = m ? JSON.parse(m[0]) : null;
     }
+    if (!parsed) return json(null, 502, { error: "Failed to parse model output." }, origin);
 
-    // ---- Extract $low–$high for UI (require $; prefer final two amounts) ----
-    const { low, high } = extractDollarRange(one_liner);
-    let lowTotal = low, highTotal = high;
-    if (lowTotal == null && highTotal == null) {
-      const mid = extractSingleAmount(one_liner);
-      if (mid != null) { lowTotal = Math.max(99, mid - 50); highTotal = mid + 50; }
-    }
-    if (lowTotal == null || highTotal == null) { lowTotal = 149; highTotal = 229; }
-    if (lowTotal > highTotal) [lowTotal, highTotal] = [highTotal, lowTotal];
-
-    const recommendedDuration =
-      highTotal <= 200 ? '60m' :
-      highTotal <= 350 ? '90m' :
-      highTotal <= 500 ? '120m' : '180m';
-
-    const payload = {
-      one_liner,
-      lowTotal: Math.round(lowTotal),
-      highTotal: Math.round(highTotal),
-      currency: 'USD',
-      recommendedDuration,
-      zip
-    };
-    if (DEBUG) payload.debug = { userPayload, tokenUsage: aiJson?.usage };
-
-    return res.status(200).json(payload);
-
-  } catch (err) {
-    console.error(err);
-    if (DEBUG) return res.status(500).json({ error: 'Estimator error', details: String(err?.message || err) });
-    return res.status(500).json({ error: 'Estimator error' });
+    // Guarantee a single authoritative number up top on your site (we send the full object).
+    return json(null, 200, { ok: true, quote: parsed }, origin);
+  } catch (e) {
+    return json(null, 500, { error: "Server error", detail: String(e) }, origin);
   }
-}
-
-/* -------- helpers (require $ sign; prefer the last two $ amounts) -------- */
-const MONEY_RE = /\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?/g;
-
-function extractDollarRange(text) {
-  const amounts = (text.match(MONEY_RE) || []).map(cleanMoney).filter(n => n != null);
-  if (amounts.length >= 2) {
-    const pair = amounts.slice(-2);
-    return { low: Math.min(pair[0], pair[1]), high: Math.max(pair[0], pair[1]) };
-  }
-  return { low: null, high: null };
-}
-function extractSingleAmount(text) {
-  const m = text.match(MONEY_RE);
-  return m && m[0] ? cleanMoney(m[0]) : null;
-}
-function cleanMoney(s) {
-  const n = Number(String(s).replace(/[^0-9.]/g,''));
-  return Number.isFinite(n) ? Math.round(n) : null;
 }
