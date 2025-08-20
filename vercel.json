@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "api/estimate.mjs": {
+      "runtime": "nodejs18.x",
+      "memory": 512,
+      "maxDuration": 20
+    }
+  }
+}
