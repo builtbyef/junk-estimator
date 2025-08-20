@@ -1,6 +1,6 @@
 // api/estimate.js — Vercel Serverless Function (Node 18+)
-// INPUT  (JSON): { description, zip, images:[dataURL... <=10], service_mode?, dimensions?, materials?, access?, distance_miles? }
-// OUTPUT (JSON): { one_liner, lowTotal, highTotal, currency:"USD", recommendedDuration, zip }
+// INPUT (JSON): { description, zip, images:[dataURL... <=10], service_mode?, dimensions?, materials?, access?, distance_miles? }
+// OUTPUT (JSON): { one_liner, lowTotal, highTotal, currency:"USD", recommendedDuration, zip, debug? }
 
 const DEBUG = process.env.DEBUG === '1';
 
@@ -9,12 +9,17 @@ export default async function handler(req, res) {
   const origin = req.headers.origin || '*';
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS, GET');
   res.setHeader(
     'Access-Control-Allow-Headers',
     req.headers['access-control-request-headers'] || 'Content-Type, Authorization'
   );
   if (req.method === 'OPTIONS') return res.status(200).end();
+
+  // Simple GET ping for quick checks
+  if (req.method === 'GET') {
+    return res.status(200).json({ ok: true, msg: 'estimator up' });
+  }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
 
   try {
@@ -94,7 +99,7 @@ Output format example (don’t add anything else):
     ];
     for (const dataUrl of imgList) {
       if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
-        // Chat Completions multimodal: image_url supports { url: "data:..." }
+        // Chat Completions multimodal requires an object with a url field
         userContent.push({ type: 'image_url', image_url: { url: dataUrl } });
       }
     }
@@ -130,10 +135,9 @@ Output format example (don’t add anything else):
       throw new Error('Empty model response');
     }
 
-    // ---- Extract $low–$high for UI (require $; prefer the final two amounts) ----
+    // ---- Extract $low–$high for UI (require $; prefer final two amounts) ----
     const { low, high } = extractDollarRange(one_liner);
     let lowTotal = low, highTotal = high;
-
     if (lowTotal == null && highTotal == null) {
       const mid = extractSingleAmount(one_liner);
       if (mid != null) { lowTotal = Math.max(99, mid - 50); highTotal = mid + 50; }
@@ -141,20 +145,22 @@ Output format example (don’t add anything else):
     if (lowTotal == null || highTotal == null) { lowTotal = 149; highTotal = 229; }
     if (lowTotal > highTotal) [lowTotal, highTotal] = [highTotal, lowTotal];
 
-    // Simple duration heuristic for booking
     const recommendedDuration =
       highTotal <= 200 ? '60m' :
       highTotal <= 350 ? '90m' :
       highTotal <= 500 ? '120m' : '180m';
 
-    return res.status(200).json({
+    const payload = {
       one_liner,
       lowTotal: Math.round(lowTotal),
       highTotal: Math.round(highTotal),
       currency: 'USD',
       recommendedDuration,
       zip
-    });
+    };
+    if (DEBUG) payload.debug = { userPayload, tokenUsage: aiJson?.usage };
+
+    return res.status(200).json(payload);
 
   } catch (err) {
     console.error(err);
