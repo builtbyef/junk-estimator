@@ -1,7 +1,6 @@
-// api/estimate.js — Vercel serverless function (Node 18+)
+// api/estimate.js — Vercel Serverless Function (Node 18+)
 // INPUT  (JSON): { description, zip, images:[dataURL... <=10], service_mode?, dimensions?, materials?, access?, distance_miles? }
 // OUTPUT (JSON): { one_liner, lowTotal, highTotal, currency:"USD", recommendedDuration, zip }
-// DEBUG: set env var DEBUG=1 in Vercel to get detailed error bodies
 
 const DEBUG = process.env.DEBUG === '1';
 
@@ -41,10 +40,10 @@ export default async function handler(req, res) {
       distance_miles = null  // one-way miles (optional)
     } = body;
 
-    // Keep payload small to avoid 413s
+    // ---- Keep payload small ----
     const imgList = Array.isArray(images) ? images.slice(0, 6) : [];
 
-    // ---- Your exact pricing prompt ----
+    // ---- Pricing/logic prompt ----
     const SYSTEM_PROMPT = `
 You are an Eastern-CT junk-removal quoting assistant for a 5×8×3 ft trailer (≈4.5 yd³; each 1 ft of trailer length ≈0.56 yd³). Use the customer inputs (photos/notes, pile length×width×height in feet, materials, access, distance, items) to estimate yards³ and weight, then price using the schedule below. Be concise; output only one sentence ending with an estimated price RANGE about $75–$125 wide.
 
@@ -80,36 +79,40 @@ ESTIMATION LOGIC:
 4) Add distance and access adjustments. If only one bulky item, compare item flat vs volume and choose lower.
 5) Output a SINGLE short customer-facing line summarizing service mode and what’s included, ENDING with an estimated RANGE about $75–$125 wide centered on your computed price.
 
-Output format example (don’t add anything else): 
-“Full-service removal, driveway to basement carry included and up to X lb disposal—Estimated range: $___–$___.”
-    `.trim();
+Output format example (don’t add anything else):
+"Full-service removal, driveway to basement carry included and up to X lb disposal—Estimated range: $***–$***."
+`.trim();
 
-    // ---- Build user parts for Responses API (input_text + input_image) ----
+    // ---- Build user content (text + images) ----
     const userPayload = {
       base_zip: '06226',
       description, zip, service_mode, dimensions, materials, access, distance_miles
     };
 
-    const userParts = [
-      { type: 'input_text', text: "INPUTS (JSON):\n" + JSON.stringify(userPayload, null, 2) }
+    const userContent = [
+      { type: 'text', text: "INPUTS (JSON):\n" + JSON.stringify(userPayload, null, 2) }
     ];
     for (const dataUrl of imgList) {
-      userParts.push({ type: 'input_image', image_url: dataUrl });
+      if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
+        userContent.push({ type: 'image_url', image_url: dataUrl });
+      }
     }
 
-    // ---- Call OpenAI Responses API ----
-    const aiRes = await fetch('https://api.openai.com/v1/responses', {
+    // ---- Call OpenAI Chat Completions (multimodal) ----
+    const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',  // vision-capable & fast
-        input: [
-          { role: 'system', content: [ { type: 'input_text', text: SYSTEM_PROMPT } ] },
-          { role: 'user',   content: userParts }
-        ]
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user',   content: userContent }
+        ],
+        temperature: 0.2,
+        max_tokens: 160
       })
     });
 
@@ -120,17 +123,14 @@ Output format example (don’t add anything else):
     }
 
     const aiJson = await aiRes.json();
-    const one_liner =
-      aiJson.output_text?.trim?.() ||
-      aiJson.choices?.[0]?.message?.content?.trim?.() ||
-      '';
+    const one_liner = aiJson?.choices?.[0]?.message?.content?.trim?.() || '';
 
     if (!one_liner) {
       if (DEBUG) return res.status(502).json({ error: 'Empty model response', details: aiJson });
       throw new Error('Empty model response');
     }
 
-    // ---- Extract $low–$high from the sentence for UI ----
+    // ---- Extract $low–$high for UI ----
     const { low, high } = extractDollarRange(one_liner);
     let lowTotal = low, highTotal = high;
     if (lowTotal == null && highTotal == null) {
@@ -140,7 +140,6 @@ Output format example (don’t add anything else):
     if (lowTotal == null || highTotal == null) { lowTotal = 149; highTotal = 229; }
     if (lowTotal > highTotal) [lowTotal, highTotal] = [highTotal, lowTotal];
 
-    // Simple duration heuristic for opening the right booking link
     const recommendedDuration =
       highTotal <= 200 ? '60m' :
       highTotal <= 350 ? '90m' :
