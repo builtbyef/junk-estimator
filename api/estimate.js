@@ -74,7 +74,7 @@ SURCHARGES / DISCOUNTS:
 
 ESTIMATION LOGIC:
 1) Estimate yards³ from photos/notes: if “feet of trailer filled” given, yards ≈ feet×0.56; else use L×W×H/27. Cap at 4.5 yd³ per trip.
-2) If heavy material threshold met, use heavy per-yd³ pricing; else compute household price via per-yd rate, then snap up to the nearest bracket.
+2) If heavy material threshold met, use heavy per-yd³ pricing; else compute household price via per-yd rate, then snap to the nearest bracket.
 3) Estimate weight by material type (light household ~200–300 lb/yd³; C&D much heavier). Apply overage if above included.
 4) Add distance and access adjustments. If only one bulky item, compare item flat vs volume and choose lower.
 5) Output a SINGLE short customer-facing line summarizing service mode and what’s included, ENDING with an estimated RANGE about $75–$125 wide centered on your computed price.
@@ -94,7 +94,8 @@ Output format example (don’t add anything else):
     ];
     for (const dataUrl of imgList) {
       if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
-        userContent.push({ type: 'image_url', image_url: dataUrl });
+        // Chat Completions multimodal: image_url supports { url: "data:..." }
+        userContent.push({ type: 'image_url', image_url: { url: dataUrl } });
       }
     }
 
@@ -112,7 +113,7 @@ Output format example (don’t add anything else):
           { role: 'user',   content: userContent }
         ],
         temperature: 0.2,
-        max_tokens: 160
+        max_tokens: 180
       })
     });
 
@@ -124,15 +125,15 @@ Output format example (don’t add anything else):
 
     const aiJson = await aiRes.json();
     const one_liner = aiJson?.choices?.[0]?.message?.content?.trim?.() || '';
-
     if (!one_liner) {
       if (DEBUG) return res.status(502).json({ error: 'Empty model response', details: aiJson });
       throw new Error('Empty model response');
     }
 
-    // ---- Extract $low–$high for UI ----
+    // ---- Extract $low–$high for UI (require $; prefer the final two amounts) ----
     const { low, high } = extractDollarRange(one_liner);
     let lowTotal = low, highTotal = high;
+
     if (lowTotal == null && highTotal == null) {
       const mid = extractSingleAmount(one_liner);
       if (mid != null) { lowTotal = Math.max(99, mid - 50); highTotal = mid + 50; }
@@ -140,6 +141,7 @@ Output format example (don’t add anything else):
     if (lowTotal == null || highTotal == null) { lowTotal = 149; highTotal = 229; }
     if (lowTotal > highTotal) [lowTotal, highTotal] = [highTotal, lowTotal];
 
+    // Simple duration heuristic for booking
     const recommendedDuration =
       highTotal <= 200 ? '60m' :
       highTotal <= 350 ? '90m' :
@@ -161,20 +163,20 @@ Output format example (don’t add anything else):
   }
 }
 
-/* -------- helpers -------- */
+/* -------- helpers (require $ sign; prefer the last two $ amounts) -------- */
+const MONEY_RE = /\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?/g;
+
 function extractDollarRange(text) {
-  // Matches $95, $1,295, 1295, etc.
-  const re = /\$?\s*\d{2,5}(?:,\d{3})?(?:\.\d{2})?/g;
-  const arr = (text.match(re) || []).map(cleanMoney).filter(x => x != null);
-  if (arr.length >= 2) {
-    const s = arr.sort((a,b)=>a-b);
-    return { low: s[0], high: s[s.length - 1] };
+  const amounts = (text.match(MONEY_RE) || []).map(cleanMoney).filter(n => n != null);
+  if (amounts.length >= 2) {
+    const pair = amounts.slice(-2);
+    return { low: Math.min(pair[0], pair[1]), high: Math.max(pair[0], pair[1]) };
   }
   return { low: null, high: null };
 }
 function extractSingleAmount(text) {
-  const m = text.match(/\$?\s*\d{2,5}(?:,\d{3})?(?:\.\d{2})?/);
-  return m ? cleanMoney(m[0]) : null;
+  const m = text.match(MONEY_RE);
+  return m && m[0] ? cleanMoney(m[0]) : null;
 }
 function cleanMoney(s) {
   const n = Number(String(s).replace(/[^0-9.]/g,''));
