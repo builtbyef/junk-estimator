@@ -77,7 +77,7 @@ async function readJson(req: IncomingMessage) {
 }
 
 function extractJsonLoose(text: string): any | null {
-  // Try ```json fences first
+  // Try ```json``` fences first
   const fence = /```json([\s\S]*?)```/i.exec(text);
   const candidate = fence ? fence[1] : null;
 
