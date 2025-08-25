@@ -1,1 +1,14 @@
+{
+  "functions": {
+    "api/**/*.ts": {
+      "runtime": "nodejs18.x"
+    }
+  },
+  "routes": [
+    {
+      "src": "/admin$",
+      "dest": "/public/admin/index.html"
+    }
+  ]
+}
 
