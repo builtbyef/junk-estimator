@@ -1,8 +1,11 @@
 {
-  "name": "junk-quote-api",
-  "private": true,
+  "name": "junk-estimator",
+  "version": "1.1.0",
   "type": "module",
+  "private": true,
   "dependencies": {
-    "undici": "^6.19.8"
+    "@vercel/blob": "0.24.1",
+    "@vercel/kv": "0.2.4",
+    "openai": "4.57.0"
   }
 }
