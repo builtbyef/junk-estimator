@@ -8,6 +8,7 @@ import LRUCache from "lru-cache";
 import { put } from "@vercel/blob";
 
 /** ---------- Config ---------- */
+// Allowed origins for CORS. When unset, allow all origins (useful for local dev).
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -34,7 +35,10 @@ type RequestBody = z.infer<typeof BodySchema>;
 
 /** ---------- Helpers ---------- */
 function setCors(res: ServerResponse, origin?: string) {
-  if (origin && allowedOrigins.includes(origin)) {
+  if (allowedOrigins.length === 0) {
+    // No restriction configured; echo the request origin (or allow all).
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  } else if (origin && allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
@@ -118,7 +122,9 @@ export default async function handler(req: any, res: any) {
     res.statusCode = 405;
     return res.end("Method Not Allowed");
   }
-  if (!origin || !allowedOrigins.includes(origin)) {
+  if (
+    allowedOrigins.length > 0 && (!origin || !allowedOrigins.includes(origin))
+  ) {
     res.statusCode = 403;
     return res.end("Forbidden");
   }
