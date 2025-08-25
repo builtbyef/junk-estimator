@@ -1,198 +1,96 @@
-// api/estimate.mjs
-export const config = { runtime: "nodejs18.x" };
+// /api/estimate.js
+import OpenAI from "openai";
+import { put } from "@vercel/blob";
 
-const OPENAI_ENDPOINT = "https://api.openai.com/v1/responses";
-const MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini"; // text+vision capable; cost-effective
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---- EDIT YOUR PRICING HERE ----
-const PRICING = {
-  currency: "USD",
-  minimum_fee: 85,                // minimum to roll a truck
-  base_per_cubic_yard: 60,        // general junk per cubic yard
-  trailer: {                       // your 5x8x3 ft trailer ≈ 4.44 CY
-    length_ft: 8, width_ft: 5, wall_ft: 3, capacity_cy: 4.44
-  },
-  heavy_materials: {              // per CY adders (weight/transfer fees)
-    concrete: 100, brick: 80, dirt: 70, shingles: 90
-  },
-  item_flat_fees: {               // add per item (examples—edit freely)
-    mattress: 80, box_spring: 60, refrigerator: 140, chest_freezer: 150,
-    couch_small: 90, couch_large: 130, dresser: 60, tv_tube: 65, piano: 350
-  },
-  surcharges: {
-    stairs_per_flight: 15,        // handling upstairs/downstairs
-    long_carry_per_50ft: 10,      // from curb/drive
-    disassembly_simple: 25,       // e.g., small furniture
-    disassembly_heavy: 60,        // e.g., sheds/hot tubs (not demolition)
-  },
-  distance_zones: [               // OPTIONAL: quick ZIP zoning
-    { name: "Zone 1", zip_prefixes: ["062", "063"], add: 0 },
-    { name: "Zone 2", zip_prefixes: ["060", "064"], add: 25 },
-    { name: "Zone 3", zip_prefixes: ["065", "066", "067"], add: 50 }
-  ],
-  taxes_pct: 0,                   // set if you tax service
-  desired_range_width: 75         // aim to keep quotes within ~this spread
-};
-// ---- END PRICING ----
+const SERVICEABLE_ZIPS = (process.env.ALLOWED_ZIPS || "06268,06269,06250,06238,06084,06279,06278,06226,06235,06280,06237,06232,06076,06029,06066,06043,06266,06256,06264")
+  .split(",").map(z => z.trim());
+const SURCHARGED_ZIPS = (process.env.SURCHARGED_ZIPS || "06084,06266,06043,06232,06066,06238")
+  .split(",").map(z => z.trim());
 
-function corsHeaders(origin) {
-  const allowList = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
-  const allowed = allowList.length === 0 ? "*" : (allowList.includes(origin) ? origin : allowList[0]);
-  return {
-    "Access-Control-Allow-Origin": allowed,
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Vary": "Origin"
-  };
-}
+const SYSTEM_PROMPT = `<<PASTE YOUR FULL PROMPT HERE EXACTLY AS PROVIDED>>`; // keep identical
 
-function json(res, status, body, origin) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json", ...corsHeaders(origin) }
-  });
-}
+function isServiceable(zip){ return SERVICEABLE_ZIPS.includes(zip); }
 
-export default async function handler(req) {
-  const origin = req.headers.get("origin") || "";
-
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders(origin) });
-  }
-  if (req.method !== "POST") {
-    return json(null, 405, { error: "Method not allowed" }, origin);
-  }
-
-  let payload;
+export default async function handler(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
   try {
-    payload = await req.json();
-  } catch {
-    return json(null, 400, { error: "Invalid JSON" }, origin);
-  }
+    const { zip, description = "", image_urls = [] } = req.body || {};
+    if (!zip || !/^\d{5}$/.test(zip)) return res.status(400).json({ error: "Invalid zip" });
+    if (!Array.isArray(image_urls) || image_urls.length === 0) {
+      return res.status(400).json({ error: "No images provided" });
+    }
 
-  const { zipcode, description, images } = payload || {};
-  if (!zipcode || !/^\d{5}$/.test(String(zipcode))) {
-    return json(null, 400, { error: "A valid 5-digit zipcode is required." }, origin);
-  }
-  if (!description || typeof description !== "string") {
-    return json(null, 400, { error: "A description is required." }, origin);
-  }
-  if (!Array.isArray(images) || images.length === 0) {
-    return json(null, 400, { error: "At least one photo is required." }, origin);
-  }
-  if (images.length > 6) {
-    return json(null, 400, { error: "Please upload up to 6 photos." }, origin);
-  }
+    if (!isServiceable(zip)) {
+      return res
+        .status(422)
+        .send("Thank you for your interest, but we are not currently servicing your area at this time.");
+    }
 
-  // Build a compact but strict system prompt and attach your pricing as JSON.
-  const systemPrompt = `
-You price junk removal jobs for a small business in New England. Use the PRICING JSON to estimate cubic yards from the description and photos, add fair surcharges, then output a SINGLE clean quote range customers can understand.
+    const userParts = [{ type: "text", text: `zip: ${zip}\ndescription: ${description || "(none)"}` }];
+    for (const url of image_urls) userParts.push({ type: "image_url", image_url: { url } });
 
-Rules:
-- Prioritize cubic yard estimate from photos; cross-check with description.
-- Add flat fees for listed items, and heavy material adders if present.
-- Apply distance zone by zipcode prefix (best match).
-- Respect minimum fee.
-- Keep the range tight (about +/- ${(PRICING.desired_range_width/2)|0} around midpoint). If uncertainty is high, you may widen, but explain briefly in notes.
-- NEVER show internal math to the customer; return structured JSON ONLY.
-
-PRICING_JSON:
-${JSON.stringify(PRICING)}
-`.trim();
-
-  // Compose Responses API input parts correctly (no 'text' type—use input_text/input_image).
-  const input = [
-    {
-      role: "system",
-      content: [{ type: "input_text", text: systemPrompt }]
-    },
-    {
-      role: "user",
-      content: [
-        { type: "input_text", text: `ZIP: ${zipcode}\nDESCRIPTION:\n${description}` },
-        // images are data URLs already (or external https URLs). The Responses API accepts full URLs.
-        ...images.map(url => ({ type: "input_image", image_url: url }))
+    const response = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userParts }
       ]
-    }
-  ];
-
-  // Structured Outputs: force a predictable JSON schema.
-  const responseFormat = {
-    type: "json_schema",
-    json_schema: {
-      name: "junk_quote",
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          low: { type: "integer", minimum: 0 },
-          high: { type: "integer", minimum: 0 },
-          midpoint: { type: "integer", minimum: 0 },
-          confidence: { type: "string", enum: ["low", "medium", "high"] },
-          yard_estimate: { type: "number", minimum: 0 },
-          distance_zone: { type: "string" },
-          line_items: {
-            type: "array",
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                label: { type: "string" },
-                qty: { type: "number" },
-                unit: { type: "string" },
-                subtotal: { type: "integer", minimum: 0 }
-              },
-              required: ["label", "subtotal"]
-            }
-          },
-          notes: { type: "string" }
-        },
-        required: ["low", "high", "midpoint", "confidence", "yard_estimate", "line_items", "notes"]
-      }
-    }
-  };
-
-  try {
-    const aiRes = await fetch(OPENAI_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        input,
-        response_format: responseFormat,
-        temperature: 0.2
-      })
     });
 
-    if (!aiRes.ok) {
-      const err = await aiRes.text();
-      return json(null, 502, { error: "OpenAI error", detail: err }, origin);
+    const raw = response.choices?.[0]?.message?.content || "";
+
+    if (/^Thank you for your interest, but we are not currently servicing your area at this time\./.test(raw.trim())) {
+      return res
+        .status(422)
+        .send("Thank you for your interest, but we are not currently servicing your area at this time.");
     }
 
-    const data = await aiRes.json();
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    const firstLine = lines[0] || "";
+    const jsonTextIndex = raw.indexOf("{");
+    const jsonText = jsonTextIndex >= 0 ? raw.slice(jsonTextIndex).trim() : "";
+    let parsed = null;
+    try { parsed = JSON.parse(jsonText); } catch {}
 
-    // The Responses API returns either output_text or structured content.
-    const raw =
-      data.output_text ??
-      data.output?.[0]?.content?.[0]?.text ??
-      JSON.stringify(data);
+    const htmlLine = firstLine.replace(/^\*\*(.+)\*\*$/, "<strong>$1</strong>");
 
-    let parsed;
+    // ===== Save result JSON to Blob =====
+    const now = new Date();
+    const dateStamp = now.toISOString().slice(0,10);
+    const ts = now.toISOString().replace(/[:.]/g, "-");
+    const safeZip = String(zip);
+    const resultKey = `results/${dateStamp}/${safeZip}-${ts}.json`;
+
+    const record = {
+      created_at: now.toISOString(),
+      zip: safeZip,
+      image_count: Array.isArray(image_urls) ? image_urls.length : 0,
+      quote_line: htmlLine.replace(/<[^>]+>/g,""),
+      result: parsed ?? null
+    };
+
+    let stored = null;
     try {
-      parsed = JSON.parse(raw);
-    } catch {
-      // Fallback: try to extract JSON if wrapped in text.
-      const m = raw.match(/\{[\s\S]*\}/);
-      parsed = m ? JSON.parse(m[0]) : null;
+      stored = await put(resultKey, JSON.stringify(record, null, 2), {
+        access: "public",
+        contentType: "application/json",
+        token: process.env.BLOB_READ_WRITE_TOKEN
+      });
+    } catch (e) {
+      console.warn("Blob save failed", e);
     }
-    if (!parsed) return json(null, 502, { error: "Failed to parse model output." }, origin);
 
-    // Guarantee a single authoritative number up top on your site (we send the full object).
-    return json(null, 200, { ok: true, quote: parsed }, origin);
-  } catch (e) {
-    return json(null, 500, { error: "Server error", detail: String(e) }, origin);
+    return res.status(200).json({
+      line: htmlLine,
+      json: parsed ?? { parse_error: true, raw },
+      stored_url: stored?.url || null,
+      key: stored?.pathname || resultKey
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Estimator failed" });
   }
 }
