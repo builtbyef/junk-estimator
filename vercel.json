@@ -1,9 +1,8 @@
 {
   "functions": {
-    "api/estimate.mjs": {
-      "runtime": "nodejs18.x",
-      "memory": 512,
-      "maxDuration": 20
-    }
+    "api/estimate.js": { "runtime": "nodejs18.x", "maxDuration": 30 },
+    "api/blob-url.js": { "runtime": "nodejs18.x", "maxDuration": 10 },
+    "api/admin-list.js": { "runtime": "nodejs18.x", "maxDuration": 10 },
+    "api/admin.js": { "runtime": "nodejs18.x", "maxDuration": 10 }
   }
 }
