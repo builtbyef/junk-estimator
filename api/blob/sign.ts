@@ -3,6 +3,9 @@ import { handleUpload, type HandleUploadBody } from "@vercel/blob/client";
 import LRUCache from "lru-cache";
 
 /** ---------- Config ---------- */
+// Allowed origins for CORS. When ALLOWED_ORIGINS is unset, requests from any
+// origin are permitted. In production, specify a comma-separated list to lock
+// this down.
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -23,7 +26,9 @@ function getIP(req: IncomingMessage) {
 }
 
 function setCors(res: ServerResponse, origin?: string) {
-  if (origin && allowedOrigins.includes(origin)) {
+  if (allowedOrigins.length === 0) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  } else if (origin && allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
@@ -61,7 +66,9 @@ export default async function handler(req: any, res: any) {
     return res.end("Method Not Allowed");
   }
 
-  if (!origin || !allowedOrigins.includes(origin)) {
+  if (
+    allowedOrigins.length > 0 && (!origin || !allowedOrigins.includes(origin))
+  ) {
     res.statusCode = 403;
     return res.end("Forbidden");
   }
