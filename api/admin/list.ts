@@ -48,7 +48,7 @@ export default async function handler(req: any, res: any) {
           const finalRange =
             j?.data?.final_range ??
             j?.data?.price_range ??
-            (j?.customer_line || "").replace(/^[^\$]*\$/,"$");
+            (j?.customer_line?.match(/\$[^\s]*/)?.[0] ?? "");
           return {
             path: b.pathname,
             url: b.url,
