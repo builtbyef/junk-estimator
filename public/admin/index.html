@@ -1,1 +1,96 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Estimator Admin</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root { color-scheme: light dark; }
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+      th, td { border-bottom: 1px solid #ccc; padding: 8px; text-align: left; font-size: 14px; }
+      th { position: sticky; top: 0; background: color-mix(in oklab, Canvas, CanvasText 5%); }
+      .badge { padding: 2px 6px; border-radius: 10px; font-size: 12px; }
+      .ok { background: #d1fae5; color: #065f46; }
+      .no { background: #fee2e2; color: #991b1b; }
+      input[type="password"] { width: 380px; }
+      a { color: inherit; }
+      small { color: #666; }
+    </style>
+  </head>
+  <body>
+    <h1>Estimator Admin</h1>
+    <div class="row">
+      <label>Bearer token:</label>
+      <input id="token" type="password" placeholder="ADMIN_TOKEN" />
+      <button id="save">Save</button>
+      <button id="refresh">Refresh</button>
+      <small id="status"></small>
+    </div>
+
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>ZIP</th>
+          <th>Range</th>
+          <th>Loads</th>
+          <th>Items</th>
+          <th>Serviceable</th>
+          <th>JSON</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <script>
+      const $ = (s) => document.querySelector(s);
+      const tokenInput = $("#token");
+      const status = $("#status");
+
+      function getToken() { return localStorage.getItem("admTok") || ""; }
+      function setToken(v) { localStorage.setItem("admTok", v); }
+
+      tokenInput.value = getToken();
+
+      $("#save").onclick = () => {
+        setToken(tokenInput.value.trim());
+        status.textContent = "Saved.";
+      };
+
+      $("#refresh").onclick = load;
+
+      async function load() {
+        status.textContent = "Loading…";
+        const r = await fetch("/api/admin/list", {
+          headers: { Authorization: "Bearer " + getToken() },
+        });
+        if (!r.ok) {
+          status.textContent = "Auth failed.";
+          return;
+        }
+        const data = await r.json();
+        const tbody = document.querySelector("#tbl tbody");
+        tbody.innerHTML = "";
+        for (const row of data) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${new Date(row.uploadedAt).toLocaleString()}</td>
+            <td>${row.zip || ""}</td>
+            <td><strong>${row.final_range || ""}</strong></td>
+            <td>${row.loads_estimated ?? ""}</td>
+            <td>${row.detected_items_count ?? 0}</td>
+            <td><span class="badge ${row.serviceable ? "ok" : "no"}">${row.serviceable ? "Yes" : "No"}</span></td>
+            <td><a href="${row.url}" target="_blank" rel="noopener">open</a></td>
+          `;
+          tbody.appendChild(tr);
+        }
+        status.textContent = `Loaded ${data.length} rows.`;
+      }
+
+      load();
+    </script>
+  </body>
+</html>
 
