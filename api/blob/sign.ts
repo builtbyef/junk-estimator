@@ -9,6 +9,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .filter(Boolean);
 
 const MAX_FILES = Number(process.env.MAX_FILES || 12);
+// Server enforces a hard limit on how many files can be uploaded per batch.
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 12);
 const MAX_TOTAL_MB = Number(process.env.MAX_TOTAL_MB || 60);
 
@@ -34,6 +35,8 @@ function setCors(res: ServerResponse, origin?: string) {
 }
 
 const rateCache = new LRUCache<string, number[]>({ max: 5000 });
+// Track how many files have been uploaded for each client-provided batch ID
+const batchCounts = new LRUCache<string, number>({ max: 5000, ttl: RATE_WINDOW_MS });
 
 function rateLimit(ip: string) {
   const now = Date.now();
@@ -78,7 +81,8 @@ export default async function handler(req: any, res: any) {
       body,
       request: req,
       onBeforeGenerateToken: async (pathname: string, clientPayload: string | null) => {
-        // Client passes size/type/aggregate via clientPayload. Enforce here.
+        // Client passes size/type/aggregate via clientPayload. Server now enforces
+        // per-batch file counts in addition to size limits.
         let meta: { size?: number; batchTotal?: number; type?: string; batchId?: string } = {};
         try {
           if (clientPayload) meta = JSON.parse(clientPayload);
@@ -88,6 +92,13 @@ export default async function handler(req: any, res: any) {
 
         if (sizeMB > MAX_FILE_MB) throw new Error(`File exceeds ${MAX_FILE_MB} MB`);
         if (totalMB > MAX_TOTAL_MB) throw new Error(`Batch exceeds ${MAX_TOTAL_MB} MB`);
+
+        const batchId = meta.batchId || "";
+        if (batchId) {
+          const count = (batchCounts.get(batchId) || 0) + 1;
+          batchCounts.set(batchId, count);
+          if (count > MAX_FILES) throw new Error(`Batch exceeds ${MAX_FILES} files`);
+        }
 
         // Allow only common image types
         const allowedContentTypes = ["image/jpeg", "image/png", "image/webp"];
@@ -105,7 +116,7 @@ export default async function handler(req: any, res: any) {
           tokenPayload: JSON.stringify({
             ip,
             ua: req.headers["user-agent"] || "",
-            batchId: meta.batchId || "",
+            batchId: batchId,
           }),
         };
       },
@@ -129,11 +140,14 @@ export default async function handler(req: any, res: any) {
   } catch (err: any) {
     console.error("sign error", err);
     res.statusCode = 400;
+    const message =
+      err instanceof Error && /exceeds/i.test(err.message)
+        ? err.message
+        : "We couldn’t process your request right now. Please try again in a few minutes.";
     res.end(
       JSON.stringify({
         error: "UPLOAD_SIGN_FAILED",
-        message:
-          "We couldn’t process your request right now. Please try again in a few minutes.",
+        message,
       })
     );
   }
